@@ -1,0 +1,35 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background: #F8FAFC;
+  font-family: Inter, system-ui, sans-serif;
+  /* Prevent iOS text size adjustment when rotating */
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Remove default input/button appearance on iOS */
+input, select, button, textarea {
+  -webkit-appearance: none;
+  appearance: none;
+  font-family: inherit;
+}
+
+/* Prevent double-tap zoom on buttons (important for fast lap tapping) */
+button {
+  touch-action: manipulation;
+}
+
+/* Prevent pull-to-refresh interfering with the timer scroll */
+body {
+  overscroll-behavior-y: contain;
+}
