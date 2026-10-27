@@ -138,15 +138,228 @@ const STORAGE_KEY = "timestudy_sessions";
 const loadSessions = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)||"[]"); } catch { return []; } };
 const saveSessions = (s) => localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
 
+// ─── Data contract (Improvement Tracker readiness) ──────────────────────────
+const SCHEMA_VERSION = "1.0";
+const BASELINE_ROLES = ["unspecified", "baseline", "trial", "post_change", "verification"];
+const STUDY_STATUSES = ["draft", "completed", "reviewed"];
+const LINK_FIELDS = [
+  ["improvementId", "Improvement ID"], ["processId", "Process ID"],
+  ["sequenceId", "Sequence ID"], ["elementId", "Element ID"],
+];
+const newStudyId = () =>
+  (typeof crypto !== "undefined" && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `study-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+const isoOrNull = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
+const blankToNull = (v) => { const s = (v ?? "").toString().trim(); return s === "" ? null : s; };
+const numOrNull = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+const round3 = (n) => (n === null || n === undefined ? null : Math.round(n * 1000) / 1000);
+const medianOf = (arr) => {
+  if (!arr.length) return null;
+  const s = [...arr].sort((a, b) => a - b), m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+const statBlock = (arr) => arr.length ? {
+  count: arr.length, totalSeconds: round3(arr.reduce((a, b) => a + b, 0)),
+  averageSeconds: round3(arr.reduce((a, b) => a + b, 0) / arr.length),
+  medianSeconds: round3(medianOf(arr)), minSeconds: round3(Math.min(...arr)), maxSeconds: round3(Math.max(...arr)),
+} : { count: 0, totalSeconds: null, averageSeconds: null, medianSeconds: null, minSeconds: null, maxSeconds: null };
+
+// Builds one study record in the exported contract. Reads legacy saved sessions safely:
+// missing fields fall back to null/defaults and nothing in the stored record is changed.
+function buildStudyRecord(rec) {
+  const c = rec.config || {};
+  const laps = rec.laps || [];
+  const included = laps.filter(l => !l.disregard);
+  const times = included.map(l => l.cycleSec);
+  const avg = times.length ? times.reduce((a, b) => a + b, 0) / times.length : null;
+  const target = numOrNull(c.targetSec);
+  const byTag = {}, byGroup = {};
+  included.forEach(l => { (byTag[l.tagKey] ||= []).push(l.cycleSec); (byGroup[l.group] ||= []).push(l.cycleSec); });
+  const mapStats = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, statBlock(v)]));
+  const studyId = c.studyId ?? null;
+  return {
+    schemaVersion: SCHEMA_VERSION, sourceApp: "TimeStudy", sourceRecordId: studyId, studyId,
+    improvementId: blankToNull(c.improvementId),
+    links: {
+      processId: blankToNull(c.processId), sequenceId: blankToNull(c.sequenceId),
+      elementId: blankToNull(c.elementId), sourceWorkStudyRecordId: blankToNull(c.sourceWorkStudyRecordId),
+    },
+    exportedAt: new Date().toISOString(),
+    units: { cycleSec: "seconds", variance: "seconds", earnedSec: "seconds", timestamp: "epoch milliseconds" },
+    study: {
+      createdAt: c.createdAt ?? isoOrNull(c.startedAt),
+      updatedAt: c.updatedAt ?? isoOrNull(rec.savedAt),
+      baselineRole: BASELINE_ROLES.includes(c.baselineRole) ? c.baselineRole : "unspecified",
+      studyStatus: STUDY_STATUSES.includes(c.studyStatus) ? c.studyStatus : "completed",
+      configuration: {
+        stationName: c.stationName ?? null, associateName: blankToNull(c.associateName),
+        targetCycleSeconds: target,
+        targetCycleEntered: { value: numOrNull(c.targetValue), unit: c.targetUnit ?? null },
+        earnedTimeThresholdSeconds: numOrNull(c.earnedSec),
+        totalQuantityRequired: numOrNull(c.totalQty), shiftLengthHours: numOrNull(c.shiftLength),
+        startedAt: isoOrNull(c.startedAt),
+        workStudyReference: c.workStudyReference ?? null, // reference only, never treated as an observed standard
+      },
+      summary: {
+        timeUnit: "seconds",
+        totalLaps: laps.length, includedLaps: included.length, disregardedLaps: laps.length - included.length,
+        sampleCount: times.length,
+        averageCycleSeconds: round3(avg), medianCycleSeconds: round3(medianOf(times)),
+        minCycleSeconds: times.length ? round3(Math.min(...times)) : null,
+        maxCycleSeconds: times.length ? round3(Math.max(...times)) : null,
+        standardDeviationSeconds: times.length > 1 ? round3(stdDev(times)) : null,
+        standardDeviationType: "population",
+        targetCycleSeconds: target, targetCycleUnit: c.targetUnit ?? null,
+        paceRating: avg && target ? round3((target / avg) * 100) : null,
+        percentAtOrBelowTarget: times.length && target ? round3(times.filter(t => t <= target).length / times.length * 100) : null,
+        totalEarnedSeconds: included.length ? round3(included.reduce((a, l) => a + (l.earnedSec || 0), 0)) : null,
+        byGroup: mapStats(byGroup), byTag: mapStats(byTag),
+      },
+    },
+    laps: laps.map(l => ({
+      n: l.n, cycleSec: l.cycleSec, timestamp: l.timestamp, timestampIso: isoOrNull(l.timestamp),
+      variance: l.variance, earnedSec: l.earnedSec, tagKey: l.tagKey, tagLabel: tagInfo(l.tagKey).label,
+      group: l.group, note: l.note || "", disregard: !!l.disregard, includedInStatistics: !l.disregard,
+    })),
+  };
+}
+
+const downloadJson = (filename, obj) => {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+};
+const studyFileName = (c) => `${(c.stationName || "study").replace(/\s+/g, "_")}_${(c.studyId || "").slice(0, 8)}.json`;
+
+// Additive only: gives legacy saved sessions a stable studyId the first time they are exported or opened here.
+function ensureStudyIds(sessions) {
+  let changed = false;
+  const out = sessions.map(s => {
+    if (s && s.config && !s.config.studyId) { changed = true; return { ...s, config: { ...s.config, studyId: newStudyId() } }; }
+    return s;
+  });
+  return { out, changed };
+}
+
+// Validates a Work Study context file completely before anything is applied.
+function validateWorkStudyContext(text) {
+  let d;
+  try { d = JSON.parse(text); } catch { return { error: "That file is not valid JSON." }; }
+  if (!d || typeof d !== "object" || Array.isArray(d)) return { error: "Expected a JSON object at the top level." };
+  if (String(d.schemaVersion ?? "").split(".")[0] !== "1")
+    return { error: `Unsupported schemaVersion "${d.schemaVersion ?? "missing"}". This app reads 1.x.` };
+  const ctx = {};
+  for (const k of ["processId", "sequenceId", "elementId", "recordId"]) {
+    const v = d[k];
+    if (v != null && v !== "" && typeof v !== "string" && typeof v !== "number") return { error: `"${k}" must be text or a number.` };
+    ctx[k] = v == null || v === "" ? null : String(v);
+  }
+  for (const k of ["targetCycleSeconds", "standardTimeSeconds"]) {
+    if (d[k] != null && !(typeof d[k] === "number" && d[k] > 0)) return { error: `"${k}" must be a positive number of seconds.` };
+    ctx[k] = d[k] ?? null;
+  }
+  if (!ctx.processId && !ctx.sequenceId && !ctx.elementId) return { error: "No processId, sequenceId, or elementId found in the file." };
+  return { ctx };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SAVED STUDIES — review, edit link/context fields, and export JSON
+// ═══════════════════════════════════════════════════════════════════════════
+function SavedStudies({ onBack }) {
+  const [sessions, setSessions] = useState(() => loadSessions());
+  const [open, setOpen] = useState(null);
+
+  const prep = () => {
+    const { out, changed } = ensureStudyIds(loadSessions());
+    if (changed) saveSessions(out);
+    setSessions(out);
+    return out;
+  };
+  // Only study details change here. Raw laps are never touched.
+  const edit = (i, patch) => {
+    const all = prep();
+    const cur = all[i].config;
+    if (Object.keys(patch).every(k => (cur[k] ?? "") === patch[k])) return;
+    all[i] = { ...all[i], config: { ...cur, ...patch, updatedAt: new Date().toISOString() } };
+    saveSessions(all);
+    setSessions(all);
+  };
+  const exportOne = (i) => { const s = prep()[i]; downloadJson(studyFileName(s.config), buildStudyRecord(s)); };
+  const exportAll = () => {
+    const all = prep();
+    downloadJson(`timestudy_export_all_${new Date().toISOString().slice(0, 10)}.json`, {
+      manifest: { appName: "TimeStudy", schemaVersion: SCHEMA_VERSION, exportedAt: new Date().toISOString(), recordCount: all.length },
+      records: all.map(buildStudyRecord),
+    });
+  };
+
+  return (
+    <div style={styles.page}>
+      <div style={styles.setupCard}>
+        <div style={{...styles.logoRow, justifyContent: "space-between"}}>
+          <span style={styles.logoText}>Saved Studies</span>
+          <button style={styles.exportBtn} onClick={onBack}>← Back</button>
+        </div>
+        <button style={{...styles.startBtn, marginTop: 0, marginBottom: 14, fontSize: 15, padding: 14, opacity: sessions.length ? 1 : 0.5}}
+          disabled={!sessions.length} onClick={exportAll}>
+          ⬇ EXPORT ALL (JSON, {sessions.length} {sessions.length === 1 ? "study" : "studies"})
+        </button>
+        {sessions.length === 0 && <div style={styles.emptyState}>No saved studies yet. Tap END on a session to save it.</div>}
+        {sessions.map((s, i) => {
+          const c = s.config || {};
+          const nLaps = (s.laps || []).length;
+          return (
+            <div key={c.studyId || `legacy-${i}`} style={{...styles.fieldGroup, gap: 8}}>
+              <div style={{fontWeight: 700}}>{c.stationName || "Untitled study"}{c.associateName ? ` — ${c.associateName}` : ""}</div>
+              <div style={styles.hint}>
+                {new Date(c.startedAt || s.savedAt).toLocaleString()} · {nLaps} laps · {c.studyStatus || "completed"} · {c.baselineRole || "unspecified"}
+              </div>
+              <div style={styles.row2}>
+                <button style={styles.exportBtn} onClick={() => exportOne(i)}>⬇ Export JSON</button>
+                <button style={styles.exportBtn} onClick={() => setOpen(open === i ? null : i)}>{open === i ? "Close details" : "Edit details"}</button>
+              </div>
+              {open === i && (
+                <>
+                  <div style={styles.row2}>
+                    <select style={styles.input} value={c.studyStatus || "completed"} onChange={e => edit(i, { studyStatus: e.target.value })}>
+                      {STUDY_STATUSES.map(x => <option key={x} value={x}>{x}</option>)}
+                    </select>
+                    <select style={styles.input} value={c.baselineRole || "unspecified"} onChange={e => edit(i, { baselineRole: e.target.value })}>
+                      {BASELINE_ROLES.map(x => <option key={x} value={x}>{x}</option>)}
+                    </select>
+                  </div>
+                  {[...LINK_FIELDS, ["sourceWorkStudyRecordId", "Source Work Study Record ID"]].map(([k, label]) => (
+                    <div key={k}>
+                      <label style={styles.label}>{label} <span style={styles.optional}>(optional)</span></label>
+                      <input style={styles.input} defaultValue={c[k] || ""} onBlur={e => edit(i, { [k]: e.target.value.trim() })} />
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SETUP SCREEN
 // ═══════════════════════════════════════════════════════════════════════════
-function SetupScreen({ onStart }) {
+function SetupScreen({ onStart, onOpenSaved }) {
   const [form, setForm] = useState({
     stationName: "", associateName: "", totalQty: "", shiftLength: "8",
     targetValue: "60", targetUnit: "sec",
     earnedValue: "300", earnedUnit: "sec",
+    improvementId: "", processId: "", sequenceId: "", elementId: "", sourceWorkStudyRecordId: "",
+    baselineRole: "unspecified", workStudyReference: null,
   });
+  const [pending, setPending] = useState(null);   // validated Work Study context awaiting confirmation
+  const [importError, setImportError] = useState("");
 
   const set = (k,v) => setForm(f=>({...f,[k]:v}));
 
@@ -157,15 +370,44 @@ function SetupScreen({ onStart }) {
       alert("Station name and target cycle time are required.");
       return;
     }
-    onStart({ ...form, targetSec, earnedSec, startedAt: Date.now() });
+    const now = Date.now(), iso = new Date(now).toISOString();
+    onStart({
+      ...form, targetSec, earnedSec, startedAt: now,
+      studyId: newStudyId(), schemaVersion: SCHEMA_VERSION, studyStatus: "draft", createdAt: iso, updatedAt: iso,
+    });
+  };
+
+  const handleContextFile = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    const res = validateWorkStudyContext(await file.text());
+    if (res.error) { setPending(null); setImportError(res.error); } else { setImportError(""); setPending(res.ctx); }
+  };
+
+  // Applies only to this unsaved setup form. Observed data is never replaced, and the
+  // imported times stay as reference values rather than becoming a declared standard.
+  const confirmContext = () => {
+    const c = pending;
+    setForm(f => ({
+      ...f,
+      processId: c.processId ?? f.processId, sequenceId: c.sequenceId ?? f.sequenceId,
+      elementId: c.elementId ?? f.elementId, sourceWorkStudyRecordId: c.recordId ?? f.sourceWorkStudyRecordId,
+      ...(c.targetCycleSeconds ? { targetValue: String(c.targetCycleSeconds), targetUnit: "sec" } : {}),
+      workStudyReference: { standardTimeSeconds: c.standardTimeSeconds, targetCycleSeconds: c.targetCycleSeconds, importedAt: new Date().toISOString() },
+    }));
+    setPending(null);
   };
 
   return (
     <div style={styles.page}>
       <div style={styles.setupCard}>
-        <div style={styles.logoRow}>
-          <span style={styles.logoIcon}>⏱</span>
-          <span style={styles.logoText}>TimeStudy</span>
+        <div style={{...styles.logoRow, justifyContent: "space-between"}}>
+          <span style={{display:"flex", alignItems:"center", gap:10}}>
+            <span style={styles.logoIcon}>⏱</span>
+            <span style={styles.logoText}>TimeStudy</span>
+          </span>
+          <button style={styles.exportBtn} onClick={onOpenSaved}>Saved Studies</button>
         </div>
         <h2 style={styles.setupTitle}>New Session</h2>
 
@@ -224,6 +466,53 @@ function SetupScreen({ onStart }) {
           </div>
           <p style={styles.hint}>= {fmt(toSeconds(form.earnedValue,form.earnedUnit))} (hh:mm:ss)</p>
         </section>
+
+        <details style={styles.fieldGroup}>
+          <summary style={{...styles.sectionHead, cursor: "pointer"}}>Linking & context (optional)</summary>
+          <p style={styles.sectionDesc}>
+            None of these are needed to run a study. They let a later Improvement Tracker or Work Study file
+            line this study up with a process, sequence, or element.
+          </p>
+          {LINK_FIELDS.map(([k, label]) => (
+            <div key={k}>
+              <label style={styles.label}>{label}</label>
+              <input style={styles.input} value={form[k]} onChange={e=>set(k, e.target.value)} />
+            </div>
+          ))}
+          <label style={styles.label}>Study role</label>
+          <select style={styles.input} value={form.baselineRole} onChange={e=>set("baselineRole", e.target.value)}>
+            {BASELINE_ROLES.map(x => <option key={x} value={x}>{x}</option>)}
+          </select>
+          <label style={{...styles.exportBtn, textAlign: "center", display: "block", marginTop: 6}}>
+            Import Work Study context (JSON)
+            <input type="file" accept="application/json,.json" style={{display: "none"}} onChange={handleContextFile} />
+          </label>
+          {importError && <p style={{...styles.hint, color: "#EF4444"}}>{importError}</p>}
+          {form.workStudyReference && (
+            <p style={styles.hint}>Work Study reference loaded: standard {form.workStudyReference.standardTimeSeconds ?? "n/a"} s (reference only).</p>
+          )}
+        </details>
+
+        {pending && (
+          <div style={styles.modalOverlay} onClick={()=>setPending(null)}>
+            <div style={styles.modalCard} onClick={e=>e.stopPropagation()}>
+              <div style={styles.modalTitle}>Import Work Study context?</div>
+              <p style={styles.modalSub}>Review before applying. This only fills the setup form below; nothing else changes.</p>
+              {[["Process ID", pending.processId], ["Sequence ID", pending.sequenceId], ["Element ID", pending.elementId],
+                ["Source record ID", pending.recordId], ["Target cycle (s)", pending.targetCycleSeconds],
+                ["Standard time (s, reference only)", pending.standardTimeSeconds]].map(([k, v]) => (
+                <div key={k} style={styles.balanceRow}>
+                  <span style={styles.balKey}>{k}</span>
+                  <span style={styles.balVal}>{v ?? "—"}</span>
+                </div>
+              ))}
+              <div style={styles.modalBtnRow}>
+                <button style={styles.modalCancel} onClick={()=>setPending(null)}>Cancel</button>
+                <button style={{...styles.modalConfirm, background: "#2563EB"}} onClick={confirmContext}>Apply to setup</button>
+              </div>
+            </div>
+          </div>
+        )}
 
         <button style={styles.startBtn} onClick={handleStart}>START SESSION</button>
       </div>
@@ -614,10 +903,19 @@ function ActiveSession({ config, onEnd }) {
 
   const handleEndSession = () => {
     const sessions = loadSessions();
-    sessions.push({ config, laps, savedAt: Date.now(), paceRating });
+    sessions.push({
+      config: { ...config, studyStatus: "completed", updatedAt: new Date().toISOString() },
+      laps, savedAt: Date.now(), paceRating, schemaVersion: SCHEMA_VERSION,
+    });
     saveSessions(sessions);
     onEnd();
   };
+
+  // Exports the study as it stands right now (status stays "draft" until END is tapped).
+  const exportJson = () => downloadJson(
+    studyFileName(config),
+    buildStudyRecord({ config: { ...config, updatedAt: new Date().toISOString() }, laps, savedAt: Date.now() })
+  );
 
   const tagsForView = buttonView === "waste" ? WASTES : DELAYS;
   const gridCells = useMemo(() => centerNormalLayout(tagsForView, isNormalTag), [tagsForView]);
@@ -632,6 +930,7 @@ function ActiveSession({ config, onEnd }) {
         </div>
         <div style={styles.lapBadge}>{validLaps.length} cycles</div>
         <button style={styles.headerExportBtn} onClick={exportEverything} title="Export all data as CSV">⬇</button>
+        <button style={styles.headerExportBtn} onClick={exportJson} title="Export this study as structured JSON">{"{ }"}</button>
         <button style={styles.endBtn} onClick={handleEndSession}>END</button>
       </div>
 
@@ -1343,9 +1642,11 @@ function TimelineLegend({ blocks }) {
 // ═══════════════════════════════════════════════════════════════════════════
 export default function App() {
   const [config, setConfig] = useState(null);
+  const [view, setView] = useState("setup");
 
-  if (!config) return <SetupScreen onStart={setConfig} />;
-  return <ActiveSession config={config} onEnd={() => setConfig(null)} />;
+  if (config) return <ActiveSession config={config} onEnd={() => { setConfig(null); setView("setup"); }} />;
+  if (view === "saved") return <SavedStudies onBack={() => setView("setup")} />;
+  return <SetupScreen onStart={setConfig} onOpenSaved={() => setView("saved")} />;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1526,4 +1827,3 @@ const styles = {
   formulaTitle: { fontSize: 11, fontWeight: 700, color: "#94A3B8", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 },
   formulaLine: { fontSize: 12, color: "#64748B", fontFamily: "DM Mono, monospace", marginBottom: 4 },
 };
-
